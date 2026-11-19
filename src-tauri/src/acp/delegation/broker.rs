@@ -448,6 +448,15 @@ struct PendingInner {
     /// would silently stomp the first's `RunningTask`. Unlike `setups` this is
     /// a plain claim with no early-terminal gating semantics.
     resuming: HashSet<String>,
+    /// Idempotency ledger for `continue_with_session`: continuation_id -> the
+    /// first Running ack. A retried call with the same id replays that ack
+    /// instead of resuming the child twice. Process-local, mirroring the
+    /// lifetime of the in-memory `completed` cache.
+    continuations: HashMap<String, DelegationTaskReport>,
+    /// Task ids whose child session was released with `close_session`.
+    /// `continue_with_session` refuses these for the rest of this run.
+    /// Process-local, like the completed cache it protects.
+    released: HashSet<String>,
 }
 
 /// One in-flight `handle_request` setup tracked for parent-cancel coverage.
@@ -969,6 +978,14 @@ pub fn build_resume_prompt(reason: Option<&str>) -> String {
         prompt.push_str(&truncate_on_char_boundary(reason, RESUME_REASON_CAP));
     }
     prompt
+}
+
+/// Build the prompt a CONTINUED child receives (`continue_with_session`).
+/// Unlike `build_resume_prompt`, this carries the caller's follow-up message verbatim:
+/// the whole point of continuation is to hand new instructions to the SAME
+/// resumed session with its prior context intact.
+pub fn build_continue_prompt(message: &str) -> String {
+    message.trim().to_string()
 }
 
 /// The `Running` ack returned by `resume_delegation` once the child is back up.
@@ -4052,6 +4069,31 @@ impl DelegationBroker {
         )
     )]
     pub async fn resume_delegation(&self, req: ResumeDelegationRequest) -> DelegationTaskReport {
+        // CONTINUE / CLOSE idempotency: a retry with the same continuation_id
+        // replays the first result instead of acting twice.
+        if let Some(cid) = req.continuation_id.as_deref() {
+            if let Some(prior) = self.pending.inner.lock().await.continuations.get(cid).cloned() {
+                return prior;
+            }
+        }
+        // CLOSE branch: release the child session instead of resuming it.
+        // Shares the wire with continue/resume; dispatched before either gate.
+        if req.close_session {
+            return self.close_session(req).await;
+        }
+        // A CONTINUE (as opposed to a plain resume) must not revive a session
+        // the caller already released with close_session.
+        if req.message.is_some()
+            && self.pending.inner.lock().await.released.contains(&req.task_id) {
+            return not_resumable_report(
+                &req.task_id,
+                TaskStatus::Canceled,
+                None,
+                None,
+                "this child session was released with close_session. Start a new \
+                 delegate_to_agent call to work on it again.",
+            );
+        }
         // Same parent-cancel coverage contract as `start_delegation`: register
         // the in-flight setup FIRST so a parent cancel landing anywhere from
         // here to park reaches it; deregistered on every exit path.
@@ -4148,6 +4190,21 @@ impl DelegationBroker {
                                 ).with_assistant(assistant.as_ref())))
                             }
                         }
+                        TaskStatus::Completed if req.message.is_some() => {
+                            // CONTINUE semantics: a completed child session is
+                            // exactly what we want to resume for follow-up work.
+                            if inner.resuming.insert(req.task_id.clone()) {
+                                MemGate::Proceed { claimed: true }
+                            } else {
+                                MemGate::Refuse(Box::new(not_resumable_report(
+                                    &req.task_id,
+                                    status,
+                                    Some(child_conversation_id),
+                                    Some(agent_type),
+                                    "a continuation of this task is already in progress.",
+                                ).with_assistant(assistant.as_ref())))
+                            }
+                        }
                         TaskStatus::Completed => MemGate::Refuse(Box::new(not_resumable_report(
                             &req.task_id,
                             status,
@@ -4203,12 +4260,48 @@ impl DelegationBroker {
         // failure alike. A `claimed: false` outcome belongs to the concurrent
         // resume that holds it; never released here.
         let claim_key = req.task_id.clone();
+        // Save the continuation idempotency key before `req` moves into the
+        // helper; a successful CONTINUE (Running ack) is recorded below.
+        let continuation_id = req.continuation_id.clone();
+        let is_continue = req.message.is_some();
         let report = self
             .resume_delegation_gated(req, inflight_id, cfg, claimed)
             .await;
         if claimed {
-            self.pending.inner.lock().await.resuming.remove(&claim_key);
+            let mut inner = self.pending.inner.lock().await;
+            inner.resuming.remove(&claim_key);
+            if is_continue {
+                if let (Some(cid), true) = (continuation_id, report.status == TaskStatus::Running) {
+                    inner.continuations.insert(cid, report.clone());
+                }
+            }
         }
+        report
+    }
+
+    /// Release a delegated child session (`close_session`). Cancels a still
+    /// running turn through the same path as `cancel_delegation` (so teardown,
+    /// meta, and the completed cache stay consistent), then records the id in
+    /// `released` so a later `continue_with_session` is refused. The child
+    /// conversation and transcript are kept — this frees resources only.
+    /// Returns the last known status, idempotently replayed via the
+    /// continuation ledger.
+    async fn close_session(&self, req: ResumeDelegationRequest) -> DelegationTaskReport {
+        let report = self
+            .cancel_task_by_id(
+                &req.parent_connection_id,
+                Some(req.parent_conversation_id),
+                &req.task_id,
+            )
+            .await;
+        {
+            let mut inner = self.pending.inner.lock().await;
+            inner.released.insert(req.task_id.clone());
+            if let Some(cid) = req.continuation_id.clone() {
+                inner.continuations.insert(cid, report.clone());
+            }
+        }
+        self.result_notify.notify_waiters();
         report
     }
 
@@ -4327,6 +4420,10 @@ impl DelegationBroker {
                          applies to a canceled or interrupted task.",
                     );
                 }
+            }
+            TaskStatus::Completed if req.message.is_some() => {
+                // CONTINUE semantics: completed is the normal entry point for
+                // follow-up work (same child session, new instructions).
             }
             TaskStatus::Completed => {
                 self.drop_inflight(inflight_id).await;
@@ -4482,7 +4579,12 @@ impl DelegationBroker {
             .spawner
             .send_resume_prompt(
                 &child_connection_id,
-                build_resume_prompt(req.reason.as_deref()),
+                // CONTINUE sends the caller message verbatim; plain RESUME
+                // sends the fixed "finish the ORIGINAL task" prompt.
+                match req.message.as_deref() {
+                    Some(msg) => build_continue_prompt(msg),
+                    None => build_resume_prompt(req.reason.as_deref()),
+                },
                 ctx.folder_id,
                 ctx.child_conversation_id,
                 // The brief rides every resume prompt too: a second copy of the
@@ -9996,6 +10098,9 @@ mod tests {
             task_id: task_id.into(),
             reason: None,
             external_handle: None,
+            message: None,
+            continuation_id: None,
+            close_session: false,
         }
     }
 

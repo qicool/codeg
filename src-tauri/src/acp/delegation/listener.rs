@@ -848,6 +848,9 @@ impl DelegationListener {
                 task_id: req.task_id,
                 reason: req.reason,
                 external_handle: req.external_handle,
+                message: req.message,
+                continuation_id: req.continuation_id,
+                close_session: req.close_session,
             })
             .await
     }
@@ -2850,6 +2853,9 @@ mod tests {
             task_id: "task-1".into(),
             reason: Some("session crashed".into()),
             external_handle: Some("h-resume".into()),
+            message: None,
+            continuation_id: None,
+            close_session: false,
         });
         write_frame(&mut client, &msg).await.unwrap();
         let ack: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -2887,6 +2893,9 @@ mod tests {
             task_id: "task-1".into(),
             reason: None,
             external_handle: None,
+            message: None,
+            continuation_id: None,
+            close_session: false,
         });
         write_frame(&mut client, &msg).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();

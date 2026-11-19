@@ -232,7 +232,28 @@ pub struct ResumeDelegationRequest {
     /// [`DelegationRequest::external_handle`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_handle: Option<String>,
-}
+    /// Follow-up message for CONTINUE semantics (`continue_with_session`).
+    ///
+    /// `None` keeps the original `resume_delegation` contract: re-run the
+    /// ORIGINAL task in the resumed child session, no new instructions. `Some`
+    /// switches the same resumption pipeline into continuation mode: the task
+    /// may be `Completed`, and this message becomes the child's next prompt.
+    /// Kept on the resume request so both paths share the (race-heavy) spawn /
+    /// resume / register machinery; the distinction is made once, at the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Caller-minted idempotency key for a continuation (`continue_with_session`
+    /// only). Repeating the same key replays the first ack instead of resuming
+    /// the child a second time. Ignored in plain resume mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_id: Option<String>,
+    /// `true` for `close_session`: release the delegated child session instead
+    /// of continuing it. Cancels a running turn, frees the child connection,
+    /// and marks the session released so later `continue_with_session` refuses.
+    /// The child conversation and its transcript are kept — this releases
+    /// resources, it does not delete anything. `#[serde(default)]` keeps the
+    /// wire compatible with older companions that omit the field.    #[serde(default)]
+    pub close_session: bool,}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {

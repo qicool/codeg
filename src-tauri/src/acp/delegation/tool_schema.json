@@ -108,6 +108,53 @@
     }
   },
   {
+    "name": "continue_with_session",
+    "description": "Send a follow-up message into an EXISTING delegated sub-agent session (same task_id from delegate_to_agent) so it continues with full prior context — do NOT start a new delegate_to_agent for the same work. Use this when a previous delegation completed, failed partway, or needs another step (fix, refine, finish remaining items). ASYNCHRONOUS: returns a Running ack for the same task_id immediately; collect the new turn's result with get_delegation_status. Rejects if the task is still running (wait or cancel first) or is unknown to this parent. A repeated continuation_id replays the first result instead of resuming twice. Prefer this over re-delegating to avoid redoing exploration and burning tokens. NOTE: this reuses the SAME task_id across turns — the status of that id moves completed -> running -> completed and the result of the previous turn is overwritten. Keep any earlier results you still need before calling; the child session itself retains the full conversation history. close_session releases the session.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "message",
+        "continuation_id"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The task_id returned by delegate_to_agent (or still shown by get_delegation_status)."
+        },
+        "message": {
+          "type": "string",
+          "description": "The follow-up prompt for the SAME sub-agent session. It already has the prior turns — only send what is new (corrections, next steps, remaining work)."
+        },
+        "continuation_id": {
+          "type": "string",
+          "description": "An idempotency id YOU mint for this request — generate a fresh unique value (e.g. a UUID) per follow-up. If you retry THIS EXACT request after an error or timeout, pass the SAME id so the follow-up is not dispatched twice. Never reuse an id for a different message."
+        }
+      }
+    }
+  },
+  {
+    "name": "close_session",
+    "description": "Release a delegated sub-agent session by task_id: cancel it if still running, free the child process/connection, and mark the session released so continue_with_session will refuse it for the rest of this codeg run. The child conversation and its transcript are kept — this frees resources, it does not delete anything. Use for fan-out cleanup or an abandoned branch. Prefer leaving a session open if you may continue it. If already finished, returns its last known status.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "continuation_id"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The task_id returned by delegate_to_agent."
+        },
+        "continuation_id": {
+          "type": "string",
+          "description": "An idempotency id YOU mint for this request — a fresh unique value (e.g. a UUID). If you retry THIS close after an error or timeout, pass the SAME id so the result is replayed instead of re-executed."
+        }
+      }
+    }
+  },
+  {
     "name": "check_user_feedback",
     "description": "IMPORTANT: This tool gives you the ability to receive the user's real-time guidance while you work, preventing you from going down the wrong path and wasting effort. The user can type corrections, new requirements, or hints at any time during your turn — but you will NEVER see them unless you call this tool. Without it, you could spend minutes on work the user has already tried to redirect.\n\nWhen to call:\n- After thinking through your approach but BEFORE starting implementation — the user may have clarified requirements.\n- Before making a significant decision (choosing an architecture, picking which files to modify, deciding on an approach) — the user may prefer a different direction.\n- After completing a sub-task and before moving to the next step — the user may want to adjust priorities.\n- When you pause to plan or organize your next steps — a natural checkpoint to read any pending guidance.\n\nThis is a quick, non-blocking snapshot that returns instantly. It either returns the user's messages (treat as HIGH-PRIORITY steering and adjust immediately) or an empty result. Call it at the checkpoints above — do not wait to be asked. If the result is empty, continue your task immediately. Do NOT call this tool again until you reach the next natural checkpoint — never call it twice in a row without doing other work in between.",
     "inputSchema": {
@@ -117,7 +164,7 @@
   },
   {
     "name": "ask_user_question",
-    "description": "Ask the user one or more multiple-choice questions and BLOCK until they answer. The questions render as interactive cards above the user's input box; this call returns only once the user submits their choices (or dismisses the card). Use ONLY when you are blocked on a decision that is genuinely the user's to make — one you cannot resolve from the request, the code, or sensible defaults (e.g. which approach, which format, which library, which of several files). Do NOT use it to ask 'should I proceed?' or to confirm an obvious default, and do NOT use it for open-ended questions that aren't a small set of discrete choices. The user can always pick 'Other' and type a custom answer, so don't add your own 'Other' option. If you want to recommend a choice, put it first and append ' (Recommended)' to its label. Prefer ONE call with a few related questions over many sequential calls. Once the user has answered \u2014 including picking a recommended option or telling you to proceed \u2014 act on the answer immediately. Do NOT call this tool again to confirm execution or to ask whether you should proceed.",
+    "description": "Ask the user one or more multiple-choice questions and BLOCK until they answer. The questions render as interactive cards above the user's input box; this call returns only once the user submits their choices (or dismisses the card). Use ONLY when you are blocked on a decision that is genuinely the user's to make — one you cannot resolve from the request, the code, or sensible defaults (e.g. which approach, which format, which library, which of several files). Do NOT use it to ask 'should I proceed?' or to confirm an obvious default, and do NOT use it for open-ended questions that aren't a small set of discrete choices. The user can always pick 'Other' and type a custom answer, so don't add your own 'Other' option. If you want to recommend a choice, put it first and append ' (Recommended)' to its label. Prefer ONE call with a few related questions over many sequential calls. Once the user has answered — including picking a recommended option or telling you to proceed — act on the answer immediately. Do NOT call this tool again to confirm execution or to ask whether you should proceed.",
     "inputSchema": {
       "type": "object",
       "required": [

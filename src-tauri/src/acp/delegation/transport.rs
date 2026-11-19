@@ -152,7 +152,17 @@ pub struct BrokerResumeTaskRequest {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_handle: Option<String>,
-}
+    /// Continuation: the follow-up message for an EXISTING child session.
+    /// Present => `continue_with_session` semantics (Completed tasks allowed,
+    /// this message is the child's next prompt). Absent => plain resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Caller-minted idempotency key for a continuation. A retry with the
+    /// same key replays the first ack. Ignored in plain resume mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_id: Option<String>,
+    /// `true` for `close_session`; shares the resume wire with `continue`.    #[serde(default)]
+    pub close_session: bool,}
 
 /// Pull the pending live-feedback notes for the parent session. Backs the
 /// `check_user_feedback` MCP tool. Authenticated by the same per-launch
@@ -1083,6 +1093,9 @@ mod tests {
             task_id: "task-1".into(),
             reason: Some("app crashed".into()),
             external_handle: Some("h1".into()),
+            message: None,
+            continuation_id: None,
+            close_session: false,
         });
         write_frame(&mut a, &msg).await.unwrap();
         let got: BrokerMessage = read_frame(&mut b).await.unwrap();

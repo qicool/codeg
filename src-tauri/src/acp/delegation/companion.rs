@@ -318,7 +318,9 @@ impl CompanionFeatures {
             "delegate_to_agent"
             | "get_delegation_status"
             | "cancel_delegation"
-            | "resume_delegation" => self.delegation,
+            | "resume_delegation"
+            | "continue_with_session"
+            | "close_session" => self.delegation,
             _ => false,
         }
     }
@@ -1040,6 +1042,104 @@ async fn build_tools_call_spawn(
                 task_id,
                 reason,
                 external_handle: Some(external_handle.clone()),
+                message: None,
+                continuation_id: None,
+                close_session: false,
+            };
+            let round_trip =
+                Box::pin(async move { client_resume_task_round_trip(&socket, &req).await });
+            register_and_spawn(
+                inflight,
+                id,
+                Some(external_handle),
+                round_trip,
+                render_task_report,
+            )
+            .await
+        }
+        "continue_with_session" => {
+            let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "continue_with_session requires a non-empty string task_id",
+                    ));
+                }
+            };
+            let message = match arguments.get("message").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "continue_with_session requires a non-empty string message",
+                    ));
+                }
+            };
+            let continuation_id = match arguments.get("continuation_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => Some(s.to_string()),
+                _ => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "continue_with_session requires a non-empty string continuation_id",
+                    ));
+                }
+            };
+            let external_handle = uuid::Uuid::new_v4().to_string();
+            let req = BrokerResumeTaskRequest {
+                token: ctx.token.clone(),
+                task_id,
+                reason: None,
+                external_handle: Some(external_handle.clone()),
+                message: Some(message),
+                continuation_id,
+                close_session: false,
+            };
+            let round_trip =
+                Box::pin(async move { client_resume_task_round_trip(&socket, &req).await });
+            register_and_spawn(
+                inflight,
+                id,
+                Some(external_handle),
+                round_trip,
+                render_task_report,
+            )
+            .await
+        }
+
+        "close_session" => {
+            let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "close_session requires a non-empty string task_id",
+                    ));
+                }
+            };
+            let continuation_id = match arguments.get("continuation_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => Some(s.to_string()),
+                _ => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "close_session requires a non-empty string continuation_id",
+                    ));
+                }
+            };
+            let external_handle = uuid::Uuid::new_v4().to_string();
+            let req = BrokerResumeTaskRequest {
+                token: ctx.token.clone(),
+                task_id,
+                reason: None,
+                external_handle: Some(external_handle.clone()),
+                message: None,
+                continuation_id,
+                close_session: true,
             };
             let round_trip =
                 Box::pin(async move { client_resume_task_round_trip(&socket, &req).await });
@@ -4581,17 +4681,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_four_delegation_tools() {
+    async fn tools_list_returns_delegation_tools() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = unwrap_respond(dispatch_for_test(line).await);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        // delegate/status/cancel/resume + the two v2 session tools.
+        assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"delegate_to_agent"));
         assert!(names.contains(&"get_delegation_status"));
         assert!(names.contains(&"cancel_delegation"));
         assert!(names.contains(&"resume_delegation"));
+        assert!(names.contains(&"continue_with_session"));
+        assert!(names.contains(&"close_session"));
         // resume_delegation requires only task_id; reason is optional and
         // there is deliberately NO task-text parameter (no new iterations).
         let resume = tools
@@ -5255,7 +5358,8 @@ mod tests {
             dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(!names.contains(&"check_user_feedback".to_string()));
-        assert_eq!(names.len(), 4);
+        // Four original delegation tools + the two v2 session tools.
+        assert_eq!(names.len(), 6);
     }
 
     #[tokio::test]
@@ -5264,7 +5368,8 @@ mod tests {
             dispatch_with_features(BOTH, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(names.contains(&"check_user_feedback".to_string()));
-        assert_eq!(names.len(), 5);
+        // Six delegation tools + check_user_feedback.
+        assert_eq!(names.len(), 7);
     }
 
     #[tokio::test]
