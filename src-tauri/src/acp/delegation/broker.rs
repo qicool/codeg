@@ -4278,8 +4278,8 @@ impl DelegationBroker {
                             Some(child_conversation_id),
                             Some(agent_type),
                             "the task already completed — resume only applies to a \
-                             canceled or interrupted task. Start a new \
-                             delegate_to_agent call for follow-up work.",
+                             canceled or interrupted task. Use continue_with_session \
+                             with the same task_id for follow-up work.",
                         ).with_assistant(assistant.as_ref()))),
                         _ => MemGate::Refuse(Box::new(not_resumable_report(
                             &req.task_id,
@@ -4522,8 +4522,8 @@ impl DelegationBroker {
                     Some(ctx.child_conversation_id),
                     Some(ctx.agent_type),
                     "the task already completed — resume only applies to a \
-                     canceled or interrupted task. Start a new delegate_to_agent \
-                     call for follow-up work.",
+                     canceled or interrupted task. Use continue_with_session with \
+                     the same task_id for follow-up work.",
                 );
             }
             TaskStatus::Failed | TaskStatus::Unknown => {
@@ -4532,24 +4532,6 @@ impl DelegationBroker {
             }
         }
         self.wait_for_child_teardown(&req.task_id).await;
-        if self
-            .spawner
-            .has_live_connection_for_conversation(ctx.child_conversation_id)
-            .await
-            || self
-                .spawner
-                .has_draining_child_for_conversation(ctx.child_conversation_id)
-                .await
-        {
-            self.drop_inflight(inflight_id).await;
-            return not_resumable_report(
-                &req.task_id,
-                TaskStatus::Running,
-                Some(ctx.child_conversation_id),
-                Some(ctx.agent_type),
-                "the child session is still active or exiting; retry once it is closed.",
-            );
-        }
         let Some(external_id) = ctx.external_id.clone() else {
             self.drop_inflight(inflight_id).await;
             return not_resumable_report(
@@ -4604,6 +4586,38 @@ impl DelegationBroker {
                 Some(req.task_id.clone()),
                 Some(ctx.agent_type),
                 &canceled_outcome(ctx.child_conversation_id, "parent canceled"),
+                None,
+            );
+        }
+        let child_id = ctx.child_conversation_id;
+        let live_connection = self
+            .spawner
+            .has_live_connection_for_conversation(child_id)
+            .await;
+        if (live_connection
+            && (req.message.is_none()
+                || !self
+                    .spawner
+                    .release_idle_for_continuation(child_id, &external_id)
+                    .await))
+            || self.spawner.has_draining_child_for_conversation(child_id).await
+        {
+            self.drop_inflight(inflight_id).await;
+            return not_resumable_report(
+                &req.task_id,
+                TaskStatus::Running,
+                Some(child_id),
+                Some(ctx.agent_type),
+                "the child session is still active or exiting; retry after it finishes or is closed.",
+            );
+        }
+        // An explicit continuation can wait for the user-opened process to
+        // exit. Check again so cancellation during that wait cannot spawn it.
+        if live_connection && self.take_inflight_cancel(inflight_id).await {
+            return report_from_outcome(
+                Some(req.task_id.clone()),
+                Some(ctx.agent_type),
+                &canceled_outcome(child_id, "parent canceled"),
                 None,
             );
         }
@@ -10325,6 +10339,44 @@ mod tests {
         assert_eq!(sends.len(), 2);
         assert_eq!(sends[1].child_conversation_id, 42);
         assert!(sends[1].prompt.contains("pick up where you left off"));
+    }
+
+    #[tokio::test]
+    async fn continuation_after_manual_turn_hands_off_only_when_child_is_idle() {
+        let (mock, _lookup, broker) = resume_harness(Some(resume_ctx(TaskStatus::Completed))).await;
+        mock.mark_conversation_live(42).await;
+        let request = || continue_request("manual-handoff", "continue from the latest reply");
+
+        let busy = broker.resume_delegation(request()).await;
+        assert_eq!(busy.error_code.as_deref(), Some(NOT_RESUMABLE_CODE));
+        assert!(mock.resume_spawn_args.lock().await.is_empty());
+        assert!(mock.live_conversations.lock().await.contains(&42));
+
+        mock.idle_conversations.lock().await.push(42);
+        mock.queue_resume_spawn(Ok(ResumedSpawn::fresh("child-after-manual")))
+            .await;
+        mock.queue_resume_send(Ok(())).await;
+        let resumed = broker.resume_delegation(request()).await;
+        assert_eq!(resumed.status, TaskStatus::Running);
+        assert_eq!(resumed.task_id.as_deref(), Some("task-1"));
+        assert!(!mock.live_conversations.lock().await.contains(&42));
+        assert_eq!(
+            mock.resume_spawn_args.lock().await[0].external_session_id,
+            "ext-session-1"
+        );
+
+        broker
+            .complete_call_from_child(
+                "task-1",
+                "child-after-manual",
+                continuation_success("follow-up reply"),
+            )
+            .await;
+        let completed = broker
+            .get_task_status("parent-conn", Some(1), "task-1", StatusWait::Immediate)
+            .await;
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.text.as_deref(), Some("follow-up reply"));
     }
 
     #[tokio::test]

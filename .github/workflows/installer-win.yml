@@ -34,7 +34,9 @@ jobs:
           shared-key: test-ubuntu-22.04-server
       - name: Run delegation tests
         working-directory: src-tauri
-        run: cargo test --locked --no-default-features --features server-bin --lib acp::delegation
+        run: |
+          cargo test --locked --no-default-features --features server-bin --lib acp::delegation
+          cargo test --locked --no-default-features --features server-bin --lib continuation_handoff_preserves_active_work_and_waits_for_child_exit
 
   build-installer:
     name: Windows x64 NSIS installer

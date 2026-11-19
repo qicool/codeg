@@ -180,6 +180,17 @@ pub trait ConnectionSpawner: Send + Sync {
     /// outside the broker (user drives it in a tab — not resumable).
     async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool;
 
+    /// Release a user-opened child that is idle so an explicit follow-up can
+    /// reload its saved session. False leaves a busy or unverified connection
+    /// alone, or means its process has not exited yet.
+    async fn release_idle_for_continuation(
+        &self,
+        _conversation_id: i32,
+        _external_session_id: &str,
+    ) -> bool {
+        false
+    }
+
     /// Whether this conversation's detached child still has a live process.
     async fn has_draining_child_for_conversation(&self, _conversation_id: i32) -> bool {
         false
@@ -228,6 +239,7 @@ pub mod mock {
         /// Conversation ids `has_live_connection_for_conversation` answers
         /// `true` for. Empty (default) = no live child connections.
         pub live_conversations: Mutex<Vec<i32>>,
+        pub idle_conversations: Mutex<Vec<i32>>,
         /// When set, `send_prompt_linked_for_delegation` awaits this receiver
         /// before returning — lets a test hold `handle_request` in the window
         /// AFTER it has reserved the child (post-spawn) but BEFORE it parks the
@@ -437,6 +449,21 @@ pub mod mock {
                 .lock()
                 .await
                 .contains(&conversation_id)
+        }
+
+        async fn release_idle_for_continuation(
+            &self,
+            conversation_id: i32,
+            _external_session_id: &str,
+        ) -> bool {
+            if !self.idle_conversations.lock().await.contains(&conversation_id) {
+                return false;
+            }
+            self.live_conversations
+                .lock()
+                .await
+                .retain(|&id| id != conversation_id);
+            true
         }
 
         async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {

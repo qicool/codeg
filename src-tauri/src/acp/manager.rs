@@ -4991,6 +4991,55 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .is_some()
     }
 
+    async fn release_idle_for_continuation(
+        &self,
+        conversation_id: i32,
+        external_session_id: &str,
+    ) -> bool {
+        let Some(conn_id) = self
+            .manager
+            .find_connection_by_conversation_id(conversation_id)
+            .await
+        else {
+            return true;
+        };
+        // Use the same admission lock as UI prompts and forks. If one is
+        // already entering, let it win; once we hold the lock a new prompt
+        // can only proceed after the old connection has been removed.
+        let Ok(lock) = self.manager.clone_prompt_lock(&conn_id).await else {
+            return false;
+        };
+        let Ok(_guard) = lock.try_lock_owned() else {
+            return false;
+        };
+        {
+            let connections = self.manager.connections.lock().await;
+            let Some(conn) = connections.get(&conn_id) else {
+                return false;
+            };
+            let Ok(state) = conn.state.try_read() else {
+                return false;
+            };
+            if state.conversation_id != Some(conversation_id)
+                || state.external_id.as_deref() != Some(external_session_id)
+                || state.status != ConnectionStatus::Connected
+                || state.turn_in_flight
+                || state.goal_active
+                || state.pending_question.is_some()
+                || state.pending_plan_approval.is_some()
+                || teardown_blocker(&state, chrono::Utc::now(), |child| {
+                    connections.contains_key(child)
+                })
+                .is_some()
+            {
+                return false;
+            }
+        }
+        // Wait for the old agent to finish writing the transcript before the
+        // new agent loads it. Use the same drain bookkeeping as broker close.
+        self.disconnect(&conn_id).await.is_ok()
+    }
+
     async fn has_draining_child_for_conversation(&self, conversation_id: i32) -> bool {
         self.manager.draining.lock().await.iter().any(|child| {
             child.conversation_id == Some(conversation_id)
@@ -6498,6 +6547,58 @@ mod tests {
             }
         );
         assert_eq!(cli_run_of(&mgr, "users-child").await, None);
+    }
+
+    #[tokio::test]
+    async fn continuation_handoff_preserves_active_work_and_waits_for_child_exit() {
+        use crate::acp::delegation::spawner::ConnectionSpawner;
+        use std::sync::atomic::Ordering;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(ConnectionManager::new());
+        let mut commands =
+            insert_live_connection(&mgr, "user-child", AgentType::ClaudeCode, None).await;
+        let child = state_of(&mgr, "user-child").await;
+        {
+            let mut state = child.write().await;
+            state.conversation_id = Some(42);
+            state.external_id = Some("child-session".into());
+            state.turn_in_flight = true;
+        }
+        let spawner = ConnectionManagerSpawner {
+            manager: Arc::clone(&mgr),
+            db: Arc::new(db),
+            data_dir: Arc::new(data_dir.path().to_path_buf()),
+        };
+        assert!(!spawner.release_idle_for_continuation(42, "child-session").await);
+        child.write().await.turn_in_flight = false;
+        child.write().await.goal_active = true;
+        assert!(!spawner.release_idle_for_continuation(42, "child-session").await);
+        child.write().await.goal_active = false;
+        let admission = mgr
+            .clone_prompt_lock("user-child")
+            .await
+            .unwrap()
+            .lock_owned()
+            .await;
+        assert!(!spawner.release_idle_for_continuation(42, "child-session").await);
+        drop(admission);
+        assert!(!spawner.release_idle_for_continuation(42, "other-session").await);
+        assert!(commands.try_recv().is_err());
+        assert!(mgr.get_state("user-child").await.is_some());
+
+        let pid = Arc::clone(&mgr.connections.lock().await["user-child"].child_pid);
+        pid.store(1, Ordering::SeqCst);
+        let release = spawner.release_idle_for_continuation(42, "child-session");
+        tokio::pin!(release);
+        assert!(futures_util::poll!(&mut release).is_pending());
+        assert!(matches!(commands.try_recv(), Ok(ConnectionCommand::Disconnect)));
+        assert!(mgr.get_state("user-child").await.is_none());
+        assert!(spawner.has_draining_child_for_conversation(42).await);
+        pid.store(0, Ordering::SeqCst);
+        assert!(release.await);
+        assert!(!spawner.has_draining_child_for_conversation(42).await);
     }
 
     #[tokio::test]
