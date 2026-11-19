@@ -4567,7 +4567,8 @@ fn render_session_summary_text(o: &Value) -> String {
 /// `structuredContent` so the frontend can read `status` + the child ids.
 pub fn render_task_report(report: &Value) -> Value {
     let status = report.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    let is_error = status == "failed";
+    let is_error = status == "failed"
+        || report.get("error_code").and_then(Value::as_str) == Some("not_resumable");
     let report_str = |key: &str| {
         report
             .get(key)
@@ -5021,6 +5022,17 @@ mod tests {
         assert_eq!(rendered["isError"], false);
         assert_eq!(rendered["content"][0]["text"], "the result");
         assert_eq!(rendered["structuredContent"]["status"], "completed");
+    }
+
+    #[test]
+    fn render_refused_continuation_as_error_even_when_task_is_running() {
+        let rendered = render_task_report(&json!({
+            "status": "running",
+            "error_code": "not_resumable",
+            "message": "Not resumed: the child is still active."
+        }));
+        assert_eq!(rendered["isError"], true);
+        assert_eq!(rendered["structuredContent"]["status"], "running");
     }
 
     #[test]

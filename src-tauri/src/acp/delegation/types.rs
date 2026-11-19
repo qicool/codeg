@@ -247,13 +247,11 @@ pub struct ResumeDelegationRequest {
     /// the child a second time. Ignored in plain resume mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_id: Option<String>,
-    /// `true` for `close_session`: release the delegated child session instead
-    /// of continuing it. Cancels a running turn, frees the child connection,
-    /// and marks the session released so later `continue_with_session` refuses.
-    /// The child conversation and its transcript are kept — this releases
-    /// resources, it does not delete anything. `#[serde(default)]` keeps the
-    /// wire compatible with older companions that omit the field.    #[serde(default)]
-    pub close_session: bool,}
+    /// `true` for `close_session`: stop the current turn and disconnect the
+    /// child while keeping the saved session available for continuation.
+    #[serde(default)]
+    pub close_session: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {

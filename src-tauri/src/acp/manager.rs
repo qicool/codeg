@@ -374,6 +374,7 @@ async fn wait_for_session_started(
 /// A connection that has left the map while its process may still be running.
 struct DrainingChild {
     agent: AgentType,
+    conversation_id: Option<i32>,
     /// The connection's live pid cell. `on_spawn` publishes the pid and
     /// `on_exit` zeroes it on a real reap.
     pid: Arc<std::sync::atomic::AtomicU32>,
@@ -2893,10 +2894,12 @@ impl ConnectionManager {
     /// Remember a connection's child until it is provably finished. Call while
     /// holding the connections lock, immediately after removing the entry.
     async fn park_draining(&self, conn: &AgentConnection) {
+        let conversation_id = conn.state.read().await.conversation_id;
         let mut draining = self.draining.lock().await;
         prune_reaped(&mut draining);
         draining.push(DrainingChild {
             agent: conn.agent_type,
+            conversation_id,
             pid: conn.child_pid.clone(),
             parked_at: std::time::Instant::now(),
         });
@@ -4988,6 +4991,13 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .is_some()
     }
 
+    async fn has_draining_child_for_conversation(&self, conversation_id: i32) -> bool {
+        self.manager.draining.lock().await.iter().any(|child| {
+            child.conversation_id == Some(conversation_id)
+                && child.pid.load(std::sync::atomic::Ordering::SeqCst) != 0
+        })
+    }
+
     async fn cancel(
         &self,
         conn_id: &str,
@@ -5002,10 +5012,31 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         &self,
         conn_id: &str,
     ) -> Result<(), crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        let pid = self
+            .manager
+            .connections
+            .lock()
+            .await
+            .get(conn_id)
+            .map(|conn| Arc::clone(&conn.child_pid));
         self.manager
             .disconnect(conn_id)
             .await
-            .map_err(|e| crate::acp::delegation::spawner::SpawnerError::Disconnect(e.to_string()))
+            .map_err(|e| SpawnerError::Disconnect(e.to_string()))?;
+        if let Some(pid) = pid {
+            // disconnect() only queues shutdown. Let the old process finish
+            // writing its transcript before another one loads the session.
+            // On timeout the draining record still blocks reuse of that row.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pid.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .map_err(|_| SpawnerError::Disconnect("child process is still exiting".into()))?;
+        }
+        Ok(())
     }
 }
 

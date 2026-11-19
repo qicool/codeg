@@ -16,9 +16,26 @@ env:
 
 concurrency:
   group: installer-win-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  test-delegation:
+    name: Delegation regression tests
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      INSTA_UPDATE: "no"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: test-ubuntu-22.04-server
+      - name: Run delegation tests
+        working-directory: src-tauri
+        run: cargo test --locked --no-default-features --features server-bin --lib acp::delegation
+
   build-installer:
     name: Windows x64 NSIS installer
     runs-on: windows-latest

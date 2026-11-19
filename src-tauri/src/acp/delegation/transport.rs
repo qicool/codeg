@@ -161,8 +161,10 @@ pub struct BrokerResumeTaskRequest {
     /// same key replays the first ack. Ignored in plain resume mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_id: Option<String>,
-    /// `true` for `close_session`; shares the resume wire with `continue`.    #[serde(default)]
-    pub close_session: bool,}
+    /// `true` for `close_session`; shares the resume wire with `continue`.
+    #[serde(default)]
+    pub close_session: bool,
+}
 
 /// Pull the pending live-feedback notes for the parent session. Backs the
 /// `check_user_feedback` MCP tool. Authenticated by the same per-launch
@@ -1108,6 +1110,17 @@ mod tests {
             }
             other => panic!("expected ResumeTask variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_request_from_older_companion_does_not_close_the_session() {
+        let req: BrokerResumeTaskRequest = serde_json::from_value(serde_json::json!({
+            "token": "tok", "task_id": "task-1", "reason": "app crashed"
+        }))
+        .unwrap();
+        assert!(!req.close_session);
+        assert!(req.message.is_none());
+        assert!(req.continuation_id.is_none());
     }
 
     #[tokio::test]

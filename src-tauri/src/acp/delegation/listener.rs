@@ -827,10 +827,17 @@ impl DelegationListener {
                 serde_json::Value::String(reason.to_string()),
             );
         }
+        let title = if req.close_session {
+            "codeg-mcp__close_session"
+        } else if req.message.is_some() {
+            "codeg-mcp__continue_with_session"
+        } else {
+            crate::acp::delegation::RESUME_TOOL_REWRITE_TITLE
+        };
         self.broker
             .rewrite_identityless_tool_call(
                 &entry.parent_connection_id,
-                crate::acp::delegation::RESUME_TOOL_REWRITE_TITLE,
+                title,
                 serde_json::Value::Object(rename_input),
             )
             .await;

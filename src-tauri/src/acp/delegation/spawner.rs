@@ -180,6 +180,11 @@ pub trait ConnectionSpawner: Send + Sync {
     /// outside the broker (user drives it in a tab — not resumable).
     async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool;
 
+    /// Whether this conversation's detached child still has a live process.
+    async fn has_draining_child_for_conversation(&self, _conversation_id: i32) -> bool {
+        false
+    }
+
     /// Cancel any in-flight prompt on the child connection. Idempotent:
     /// calling on a connection with nothing in flight is a no-op success.
     async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError>;

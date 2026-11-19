@@ -109,7 +109,7 @@
   },
   {
     "name": "continue_with_session",
-    "description": "Send a follow-up message into an EXISTING delegated sub-agent session (same task_id from delegate_to_agent) so it continues with full prior context — do NOT start a new delegate_to_agent for the same work. Use this when a previous delegation completed, failed partway, or needs another step (fix, refine, finish remaining items). ASYNCHRONOUS: returns a Running ack for the same task_id immediately; collect the new turn's result with get_delegation_status. Rejects if the task is still running (wait or cancel first) or is unknown to this parent. A repeated continuation_id replays the first result instead of resuming twice. Prefer this over re-delegating to avoid redoing exploration and burning tokens. NOTE: this reuses the SAME task_id across turns — the status of that id moves completed -> running -> completed and the result of the previous turn is overwritten. Keep any earlier results you still need before calling; the child session itself retains the full conversation history. close_session releases the session.",
+    "description": "Send a follow-up message into an EXISTING delegated sub-agent session (same task_id from delegate_to_agent) so it continues with full prior context — do NOT start a new delegate_to_agent for the same work. Use this when a previous delegation completed, failed partway, or needs another step (fix, refine, finish remaining items). ASYNCHRONOUS: returns a Running ack for the same task_id immediately; collect the new turn's result with get_delegation_status. Rejects if the task is still running (wait or cancel first) or is unknown to this parent. A repeated continuation_id replays the first result instead of resuming twice. Prefer this over re-delegating to avoid redoing exploration and burning tokens. NOTE: this reuses the SAME task_id across turns — the status of that id moves completed -> running -> completed and the result of the previous turn is overwritten. Keep any earlier results you still need before calling; the child session itself retains the full conversation history. You can continue with the same task_id after close_session: Codeg reloads the saved child session and its prior context.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -135,7 +135,7 @@
   },
   {
     "name": "close_session",
-    "description": "Release a delegated sub-agent session by task_id: cancel it if still running, free the child process/connection, and mark the session released so continue_with_session will refuse it for the rest of this codeg run. The child conversation and its transcript are kept — this frees resources, it does not delete anything. Use for fan-out cleanup or an abandoned branch. Prefer leaving a session open if you may continue it. If already finished, returns its last known status.",
+    "description": "Release a delegated child process and connection by task_id. Stops the current turn if still running and returns its status. The saved conversation and task_id remain available: call continue_with_session with the same task_id to load the session and continue with its prior context. A retry with the same continuation_id replays this close without stopping a later turn.",
     "inputSchema": {
       "type": "object",
       "required": [

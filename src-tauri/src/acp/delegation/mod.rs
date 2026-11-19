@@ -25,10 +25,9 @@
 //!   parent LLM ◄── MCP tool_result ◄── DelegationOutcome ◄───┘
 //! ```
 //!
-//! v1 is one-shot (function-call semantics): after the child's first
-//! `TurnComplete`, the broker resolves the pending call, sends `disconnect`
-//! to the child, and returns. v2 will introduce `continue_with_session` /
-//! `close_session` tools without protocol breakage.
+//! Each turn disconnects its child after completion. `continue_with_session`
+//! reopens the saved child session under the same task id. `close_session`
+//! releases its connection and process without deleting that saved session.
 //!
 //! One deliberate exception to one-shot: `resume_delegation` revives a task
 //! that was INTERRUPTED (canceled, or stranded by a crash) by re-spawning its
