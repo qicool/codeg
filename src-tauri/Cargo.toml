@@ -233,7 +233,8 @@ toml_edit = "0.19"
 serde_yaml = "0.9"
 notify = "6"
 base64 = "0.22"
-kill_tree = { version = "0.2", features = ["tokio"] }
+# Local 0.2.4 patch rejects repeated PIDs instead of growing an unbounded kill list.
+kill_tree = { version = "0.2.4", path = "vendor/kill_tree", features = ["tokio"] }
 which = "7"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
 axum = { version = "0.8", features = ["ws", "multipart"] }

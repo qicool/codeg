@@ -507,7 +507,15 @@ impl Drop for ChildGuard {
             return;
         };
 
+        #[cfg(not(windows))]
         let _ = kill_tree::blocking::kill_tree(pid);
+        #[cfg(windows)]
+        if let Err(error) = kill_tree::blocking::kill_tree(pid) {
+            tracing::debug!(pid, %error, "[ACP] process tree cleanup failed; stopping the owned child");
+            // A rejected snapshot is unsafe to act on. Terminate the agent
+            // through its existing process handle and leave reaping unchanged.
+            let _ = child.start_kill();
+        }
 
         // `kill_tree` only signals (SIGTERM on Unix) and does not wait, so the
         // process may well outlive this call. Keep OWNING the child until it is
