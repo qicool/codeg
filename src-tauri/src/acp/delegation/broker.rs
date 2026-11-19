@@ -4255,7 +4255,7 @@ impl DelegationBroker {
                                     status,
                                     Some(child_conversation_id),
                                     Some(agent_type),
-                                    "another continuation, resume, or close of this task is in progress.",
+                                    "another continuation, resume, or close of this task is already in progress.",
                                 ).with_assistant(assistant.as_ref())))
                             }
                         }
@@ -4268,7 +4268,7 @@ impl DelegationBroker {
                                     status,
                                     Some(child_conversation_id),
                                     Some(agent_type),
-                                    "another continuation, resume, or close of this task is in progress.",
+                                    "another continuation, resume, or close of this task is already in progress.",
                                 ).with_assistant(assistant.as_ref())))
                             }
                         }
@@ -4507,7 +4507,7 @@ impl DelegationBroker {
                 ctx.status,
                 Some(ctx.child_conversation_id),
                 Some(ctx.agent_type),
-                "another continuation, resume, or close of this task is in progress.",
+                "another continuation, resume, or close of this task is already in progress.",
             );
         }
         match ctx.status {
