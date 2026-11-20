@@ -1397,7 +1397,8 @@ impl ConnectionManager {
                     return Err(AcpError::TurnInProgress);
                 }
                 s.borrowed_turn = Some(Arc::clone(&live.turn));
-                s.last_borrowed_task_id = Some(live.task_id.to_string());
+                s.last_borrowed_binding =
+                    Some((live.task_id.to_string(), live.external_session_id.to_string()));
             }
             if s.turn_in_flight {
                 // Names the gate, not just the outcome: the linked path checks
@@ -1410,7 +1411,7 @@ impl ConnectionManager {
                 );
                 return Err(AcpError::TurnInProgress);
             }
-            if s.last_borrowed_task_id.is_some() {
+            if s.last_borrowed_binding.is_some() {
                 s.borrowed_status_after_seq = Some(s.event_seq);
             }
             s.turn_in_flight = true;
@@ -5139,7 +5140,9 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             };
             let state = conn.state.read().await;
             if state.conversation_id != Some(conversation_id)
-                || state.last_borrowed_task_id.as_deref() != Some(task_id)
+                || !state.last_borrowed_binding.as_ref().is_some_and(|(task, session)| {
+                    task == task_id && state.external_id.as_deref() == Some(session.as_str())
+                })
             {
                 return true;
             }
@@ -6736,6 +6739,14 @@ mod tests {
         assert_eq!(pid.load(Ordering::SeqCst), 1234);
         pid.store(0, Ordering::SeqCst);
         assert!(!spawner.close_borrowed_for_task(row.id, "task-1").await);
+        {
+            let mut state = child.write().await;
+            state.turn_in_flight = false;
+            state.external_id = Some("forked-session".into());
+        }
+        assert!(spawner.close_borrowed_for_task(row.id, "task-1").await);
+        assert!(commands.try_recv().is_err());
+        assert!(mgr.get_state("user-child").await.is_some());
     }
 
     #[tokio::test]

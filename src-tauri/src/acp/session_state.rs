@@ -784,7 +784,8 @@ pub struct SessionState {
 
     pub(crate) borrowed_turn: Option<Arc<crate::acp::delegation::spawner::BorrowedTurn>>,
     pub(crate) borrowed_prompt_started: bool,
-    pub(crate) last_borrowed_task_id: Option<String>,
+    /// Task id and native session id of the last admitted borrowed prompt.
+    pub(crate) last_borrowed_binding: Option<(String, String)>,
     /// Lower bound for status writes, retained after a borrowed turn so a
     /// subsequent manual turn can also fence out delayed status events.
     pub(crate) borrowed_status_after_seq: Option<u64>,
@@ -1005,7 +1006,7 @@ impl SessionState {
             agent_initiated_turn: false,
             borrowed_turn: None,
             borrowed_prompt_started: false,
-            last_borrowed_task_id: None,
+            last_borrowed_binding: None,
             borrowed_status_after_seq: None,
             turns_completed: 0,
             turn_file_jobs: Vec::new(),
