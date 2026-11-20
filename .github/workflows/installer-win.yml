@@ -29,17 +29,36 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       INSTA_UPDATE: "no"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare memory and disk for Rust tests
+        run: |
+          # This server-only job does not use the runner's Android SDK.
+          sudo rm -rf -- /usr/local/lib/android
+          available_bytes=$(df -B1 --output=avail "$RUNNER_TEMP" | tail -n 1)
+          if (( available_bytes < 24 * 1024 * 1024 * 1024 )); then
+            echo "::error::Need at least 24 GiB free before allocating test swap"
+            df -h "$RUNNER_TEMP"
+            exit 1
+          fi
+          swap_file="$RUNNER_TEMP/codeg-regression.swap"
+          sudo fallocate -l 8G "$swap_file"
+          sudo chmod 600 "$swap_file"
+          sudo mkswap "$swap_file"
+          sudo swapon "$swap_file"
+          swapon --show
+          free -h
+          df -h "$RUNNER_TEMP"
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
           shared-key: test-ubuntu-22.04-server
-      - name: Run delegation tests
+      - name: Compile delegation tests
         working-directory: src-tauri
         run: |
           (
@@ -47,11 +66,17 @@ jobs:
               date -u
               free -h
               df -h .
+              ps -eo pid,comm,rss,pcpu --sort=-rss | sed -n '1,8p'
+              cat /proc/pressure/memory
               sleep 30
             done
           ) &
           monitor_pid=$!
           trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          /usr/bin/time -v cargo test --locked --no-default-features --features server-bin --lib --no-run
+      - name: Run delegation tests
+        working-directory: src-tauri
+        run: |
           cargo test --locked --no-default-features --features server-bin --lib acp::delegation
           cargo test --locked --no-default-features --features server-bin --lib continuation_reuses_idle_connection_and_cancels_only_its_turn
           cargo test --locked --no-default-features --features server-bin --lib acp::lifecycle
