@@ -4681,9 +4681,10 @@ impl DelegationBroker {
                     );
                 }
             };
-            // A tab may have connected after lookup. Retry once the returned
-            // connection is bound to the saved row and can be verified.
-            if spawned.reused {
+            // Dedup can find a restored tab before it binds the Codeg row, or
+            // after it races the first lookup. Continue through the borrowed
+            // turn admission checks; plain resume still requires its own child.
+            if spawned.reused && req.message.is_none() {
                 self.drop_inflight(inflight_id).await;
                 return not_resumable_report(
                     &req.task_id,
@@ -4693,7 +4694,10 @@ impl DelegationBroker {
                     "the child session already has an active connection; retry when it is idle.",
                 );
             }
-            (spawned.connection_id, None)
+            (
+                spawned.connection_id,
+                spawned.reused.then(|| Arc::new(BorrowedTurn::default())),
+            )
         };
         // Checkpoint #2: a parent cancel during spawn — the connection exists
         // but no prompt went out; disconnect-only teardown.
@@ -10875,6 +10879,54 @@ mod tests {
         assert_eq!(broker.inflight_count().await, 0);
         assert_eq!(broker.reserved_call_count().await, 0);
         assert!(broker.pending.inner.lock().await.resuming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_borrows_connection_found_by_spawn_dedup_when_idle() {
+        let (mock, _lookup, broker) = resume_harness(Some(resume_ctx(TaskStatus::Completed))).await;
+        let request = || continue_request("dedup-handoff", "follow up on the restored child");
+
+        mock.queue_resume_spawn(Ok(ResumedSpawn::reused("user-conn")))
+            .await;
+        let busy = broker.resume_delegation(request()).await;
+        assert_eq!(busy.error_code.as_deref(), Some(NOT_RESUMABLE_CODE));
+        assert!(mock.resume_send_args.lock().await.is_empty());
+        assert!(mock.disconnects.lock().await.is_empty());
+
+        mock.idle_conversations.lock().await.push(42);
+        mock.queue_resume_spawn(Ok(ResumedSpawn::reused("user-conn")))
+            .await;
+        mock.queue_resume_send(Ok(())).await;
+        let resumed = broker.resume_delegation(request()).await;
+        assert_eq!(resumed.status, TaskStatus::Running);
+        assert_eq!(resumed.error_code, None);
+        assert_eq!(mock.resume_send_args.lock().await[0].conn_id, "user-conn");
+        let turn = broker.pending.inner.lock().await.running["task-1"]
+            .borrowed_turn
+            .as_ref()
+            .unwrap()
+            .clone();
+        turn.completion
+            .set(crate::acp::delegation::spawner::BorrowedCompletion {
+                seq: 12,
+                text: Some("follow-up reply".into()),
+                progress: None,
+            })
+            .unwrap();
+        broker
+            .complete_call_from_child(
+                "task-1",
+                "user-conn",
+                12,
+                continuation_success("manual text"),
+            )
+            .await;
+        let completed = broker
+            .get_task_status("parent-conn", Some(1), "task-1", StatusWait::Immediate)
+            .await;
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.text.as_deref(), Some("follow-up reply"));
+        assert!(mock.disconnects.lock().await.is_empty());
     }
 
     /// A resumed task is cancelable again through the ordinary path — the

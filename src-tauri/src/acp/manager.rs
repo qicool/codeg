@@ -625,12 +625,10 @@ fn teardown_blocker(
 
 fn can_borrow_turn(
     state: &crate::acp::session_state::SessionState,
-    conversation_id: i32,
     external_session_id: &str,
     child_live: impl Fn(&str) -> bool,
 ) -> bool {
-    state.conversation_id == Some(conversation_id)
-        && state.external_id.as_deref() == Some(external_session_id)
+    state.external_id.as_deref() == Some(external_session_id)
         && state.status == ConnectionStatus::Connected
         && !state.turn_in_flight
         && !state.agent_initiated_turn
@@ -1390,7 +1388,8 @@ impl ConnectionManager {
             if let Some((cid, live)) = live {
                 let connections = connections.as_ref().expect("live prompt holds connections");
                 if !connections.contains_key(conn_id)
-                    || !can_borrow_turn(&s, cid, live.external_session_id, |child| {
+                    || s.conversation_id != Some(cid)
+                    || !can_borrow_turn(&s, live.external_session_id, |child| {
                         connections.contains_key(child)
                     })
                 {
@@ -1635,9 +1634,11 @@ impl ConnectionManager {
             let (bound, in_flight, launch_dir) = {
                 let s = conn.state.read().await;
                 if let Some((cid, live)) = live {
-                    if !can_borrow_turn(&s, cid, live.external_session_id, |child| {
-                        connections.contains_key(child)
-                    }) {
+                    if s.conversation_id.is_some_and(|bound| bound != cid)
+                        || !can_borrow_turn(&s, live.external_session_id, |child| {
+                            connections.contains_key(child)
+                        })
+                    {
                         return Err(AcpError::TurnInProgress);
                     }
                 }
@@ -1748,6 +1749,9 @@ impl ConnectionManager {
             let task_emitter = emitter.clone();
             let task_conn_id = conn_id.to_string();
             let task_delegation = delegation.clone();
+            let borrowed_session = live.map(|(_, live)| {
+                (live.task_id.to_owned(), live.external_session_id.to_owned())
+            });
             let handle = tokio::spawn(async move {
                 // Holding the owned guard for the whole task is what shields the
                 // bind + publication from caller cancellation.
@@ -1819,7 +1823,25 @@ impl ConnectionManager {
                     // before SessionStarted) is unaffected and continues to be
                     // handled by the lifecycle subscriber.
                     let eid_opt = task_state.read().await.external_id.clone();
-                    let preserved = if let Some(eid) = eid_opt {
+                    let preserved = if let Some((task_id, expected_session)) = borrowed_session {
+                        // A restored tab may know the agent session but not its
+                        // Codeg row. Adopt only the row that already owns that
+                        // session; the ordinary first-prompt bind may repoint it.
+                        let row = conversation_service::get_by_delegation_call_id(&db_conn, &task_id)
+                            .await
+                            .map_err(|e| AcpError::protocol(e.to_string()))?;
+                        if eid_opt.as_deref() != Some(expected_session.as_str())
+                            || !row.is_some_and(|row| {
+                                row.id == linked_conversation_id
+                                    && row.folder_id == linked_folder_id
+                                    && row.agent_type == agent_type
+                                    && row.external_id.as_deref() == Some(expected_session.as_str())
+                            })
+                        {
+                            return Err(AcpError::TurnInProgress);
+                        }
+                        None
+                    } else if let Some(eid) = eid_opt {
                         // THE codeg#500 write. Branch A above adopts a row the
                         // caller supplied, which may still be bound to an older
                         // session — a connection spawned with `session_id = None`
@@ -6658,13 +6680,30 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_reuses_idle_connection_and_cancels_only_its_turn() {
-        use crate::acp::delegation::spawner::{ConnectionSpawner, SpawnerError};
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink, SpawnerError};
         use std::sync::atomic::Ordering;
 
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/borrowed-child").await;
-        let row = conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
-            .await.unwrap();
+        let parent_row =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let row = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_row.id,
+                parent_tool_use_id: "tool-1".into(),
+                delegation_call_id: "task-1".into(),
+                assistant: None,
+            }),
+        )
+        .await
+        .unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let mgr = Arc::new(ConnectionManager::new());
         mgr.insert_test_connection("parent", AgentType::ClaudeCode, None, EventEmitter::Noop).await;
@@ -6673,7 +6712,6 @@ mod tests {
         let child = state_of(&mgr, "user-child").await;
         {
             let mut state = child.write().await;
-            state.conversation_id = Some(row.id);
             state.external_id = Some("child-session".into());
             state.turn_in_flight = true;
         }
@@ -6710,12 +6748,29 @@ mod tests {
         parent.write().await.cli_run = Some(cli_tag("restricted"));
         assert!(matches!(send("child-session").await, Err(SpawnerError::ContinuationUnavailable)));
         parent.write().await.cli_run = None;
+        child.write().await.conversation_id = Some(parent_row.id);
+        assert!(matches!(
+            send("child-session").await,
+            Err(SpawnerError::ContinuationUnavailable)
+        ));
+        child.write().await.conversation_id = None;
+        // A native ID on the connection is insufficient if the saved task
+        // does not already own it. In particular, the send may not claim it.
+        assert!(matches!(
+            send("child-session").await,
+            Err(SpawnerError::ContinuationUnavailable)
+        ));
+        assert_eq!(child.read().await.conversation_id, None);
         assert!(commands.try_recv().is_err());
         assert!(mgr.get_state("user-child").await.is_some());
 
+        conversation_service::bind_external_id(&spawner.db.conn, row.id, "child-session", &[])
+            .await
+            .unwrap();
         let pid = Arc::clone(&mgr.connections.lock().await["user-child"].child_pid);
         pid.store(1234, Ordering::SeqCst);
         send("child-session").await.unwrap();
+        assert_eq!(child.read().await.conversation_id, Some(row.id));
         assert!(matches!(commands.try_recv(), Ok(ConnectionCommand::Prompt { .. })));
         let done = AcpEvent::TurnComplete {
             session_id: "child-session".into(),
