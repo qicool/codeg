@@ -11,6 +11,7 @@
 //! the manager's surface area contiguous.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 
@@ -42,6 +43,8 @@ pub struct AssistantLink {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnerError {
+    #[error("the child connection is no longer idle or no longer matches the saved session")]
+    ContinuationUnavailable,
     #[error("spawn failed: {0}")]
     Spawn(String),
     #[error("send prompt failed: {0}")]
@@ -50,6 +53,27 @@ pub enum SpawnerError {
     Disconnect(String),
     #[error("cancel failed: {0}")]
     Cancel(String),
+}
+
+/// Identifies one delegated prompt on a user-owned connection. Capture the
+/// completion under the state lock before a later manual prompt can replace it.
+#[derive(Debug, Default)]
+pub struct BorrowedTurn {
+    pub(crate) completion: OnceLock<BorrowedCompletion>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BorrowedCompletion {
+    pub seq: u64,
+    pub text: Option<String>,
+    pub progress: Option<super::types::DelegationProgress>,
+}
+
+pub struct LiveContinuation<'a> {
+    pub external_session_id: &'a str,
+    pub parent_connection_id: &'a str,
+    pub task_id: &'a str,
+    pub turn: Arc<BorrowedTurn>,
 }
 
 /// Result of [`ConnectionSpawner::spawn_for_resume`]: the connection now
@@ -172,23 +196,13 @@ pub trait ConnectionSpawner: Send + Sync {
         folder_id: i32,
         child_conversation_id: i32,
         brief: Option<String>,
+        live: Option<LiveContinuation<'_>>,
     ) -> Result<(), SpawnerError>;
 
-    /// Whether any live connection is currently bound to `conversation_id`.
-    /// Used by `resume_delegation` to tell a stale `in_progress` row (crash
-    /// leftover — resumable) from a child session that is genuinely active
-    /// outside the broker (user drives it in a tab — not resumable).
-    async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool;
-
-    /// Release a user-opened child that is idle so an explicit follow-up can
-    /// reload its saved session. False leaves a busy or unverified connection
-    /// alone, or means its process has not exited yet.
-    async fn release_idle_for_continuation(
-        &self,
-        _conversation_id: i32,
-        _external_session_id: &str,
-    ) -> bool {
-        false
+    /// Look up the existing connection. `send_resume_prompt` must still
+    /// validate its identity and idleness atomically at prompt admission.
+    async fn live_connection_for_continuation(&self, _conversation_id: i32) -> Option<String> {
+        None
     }
 
     /// Whether this conversation's detached child still has a live process.
@@ -200,9 +214,20 @@ pub trait ConnectionSpawner: Send + Sync {
     /// calling on a connection with nothing in flight is a no-op success.
     async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError>;
 
-    /// Tear down the child connection. Always called after the broker has
-    /// resolved (or failed) the pending call, to enforce v1's one-shot
-    /// semantics.
+    /// Cancel only this admitted turn of a user-owned connection.
+    async fn cancel_borrowed(
+        &self,
+        conn_id: &str,
+        turn: &Arc<BorrowedTurn>,
+    ) -> Result<(), SpawnerError>;
+
+    /// Explicit close may release a previously borrowed child, if it has
+    /// not moved on to other work. Ordinary completion never calls this.
+    async fn close_borrowed_for_task(&self, _conversation_id: i32, _task_id: &str) -> bool {
+        true
+    }
+
+    /// Tear down a child connection owned by the broker.
     async fn disconnect(&self, conn_id: &str) -> Result<(), SpawnerError>;
 }
 
@@ -236,8 +261,7 @@ pub mod mock {
         pub resume_send_results: Mutex<VecDeque<Result<(), SpawnerError>>>,
         pub resume_spawn_args: Mutex<Vec<ResumeSpawnCallArgs>>,
         pub resume_send_args: Mutex<Vec<ResumeSendCallArgs>>,
-        /// Conversation ids `has_live_connection_for_conversation` answers
-        /// `true` for. Empty (default) = no live child connections.
+        /// Conversation ids for which the mock returns a live connection.
         pub live_conversations: Mutex<Vec<i32>>,
         pub idle_conversations: Mutex<Vec<i32>>,
         /// When set, `send_prompt_linked_for_delegation` awaits this receiver
@@ -321,8 +345,7 @@ pub mod mock {
             self.resume_send_results.lock().await.push_back(r);
         }
 
-        /// Mark `conversation_id` as having a live connection, so
-        /// `has_live_connection_for_conversation` answers `true` for it.
+        /// Mark `conversation_id` as having a live connection.
         pub async fn mark_conversation_live(&self, conversation_id: i32) {
             self.live_conversations.lock().await.push(conversation_id);
         }
@@ -429,7 +452,13 @@ pub mod mock {
             folder_id: i32,
             child_conversation_id: i32,
             brief: Option<String>,
+            live: Option<LiveContinuation<'_>>,
         ) -> Result<(), SpawnerError> {
+            if live.is_some()
+                && !self.idle_conversations.lock().await.contains(&child_conversation_id)
+            {
+                return Err(SpawnerError::ContinuationUnavailable);
+            }
             self.resume_send_args.lock().await.push(ResumeSendCallArgs {
                 conn_id: conn_id.to_string(),
                 prompt,
@@ -444,31 +473,25 @@ pub mod mock {
                 .unwrap_or_else(|| Err(SpawnerError::Send("no queued resume send result".into())))
         }
 
-        async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool {
+        async fn live_connection_for_continuation(&self, conversation_id: i32) -> Option<String> {
             self.live_conversations
                 .lock()
                 .await
                 .contains(&conversation_id)
-        }
-
-        async fn release_idle_for_continuation(
-            &self,
-            conversation_id: i32,
-            _external_session_id: &str,
-        ) -> bool {
-            if !self.idle_conversations.lock().await.contains(&conversation_id) {
-                return false;
-            }
-            self.live_conversations
-                .lock()
-                .await
-                .retain(|&id| id != conversation_id);
-            true
+                .then(|| format!("live-{conversation_id}"))
         }
 
         async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {
             self.cancels.lock().await.push(conn_id.to_string());
             Ok(())
+        }
+
+        async fn cancel_borrowed(
+            &self,
+            conn_id: &str,
+            _turn: &Arc<BorrowedTurn>,
+        ) -> Result<(), SpawnerError> {
+            self.cancel(conn_id).await
         }
 
         async fn disconnect(&self, conn_id: &str) -> Result<(), SpawnerError> {

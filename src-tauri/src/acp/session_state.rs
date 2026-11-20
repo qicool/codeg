@@ -782,6 +782,13 @@ pub struct SessionState {
     /// serialized: backend-internal, like `turn_in_flight`.
     pub agent_initiated_turn: bool,
 
+    pub(crate) borrowed_turn: Option<Arc<crate::acp::delegation::spawner::BorrowedTurn>>,
+    pub(crate) borrowed_prompt_started: bool,
+    pub(crate) last_borrowed_task_id: Option<String>,
+    /// Lower bound for status writes, retained after a borrowed turn so a
+    /// subsequent manual turn can also fence out delayed status events.
+    pub(crate) borrowed_status_after_seq: Option<u64>,
+
     /// How many `TurnComplete`s this connection has applied — the turn's
     /// IDENTITY, paired with `turn_in_flight`. `turn_in_flight` alone only says
     /// "some turn is running"; a caller that admitted itself against turn N and
@@ -996,6 +1003,10 @@ impl SessionState {
             pending_user_message_started_at: None,
             turn_in_flight: false,
             agent_initiated_turn: false,
+            borrowed_turn: None,
+            borrowed_prompt_started: false,
+            last_borrowed_task_id: None,
+            borrowed_status_after_seq: None,
             turns_completed: 0,
             turn_file_jobs: Vec::new(),
             last_turn_ended_abnormally: false,
@@ -1628,7 +1639,21 @@ impl SessionState {
                 // A turn the agent started itself never held the gate; a set
                 // flag then belongs to a prompt admitted while it ran.
                 if !self.agent_initiated_turn {
-                    self.turn_in_flight = false;
+                    // A duplicate completion from the previous turn cannot
+                    // release a queued borrowed prompt before it starts.
+                    if self.borrowed_turn.is_none() || self.borrowed_prompt_started {
+                        self.turn_in_flight = false;
+                        if let Some(turn) = self.borrowed_turn.take() {
+                            let _ = turn.completion.set(
+                                crate::acp::delegation::spawner::BorrowedCompletion {
+                                    seq: self.event_seq + 1,
+                                    text: self.last_assistant_text.clone(),
+                                    progress: self.last_turn_progress.clone(),
+                                },
+                            );
+                        }
+                        self.borrowed_prompt_started = false;
+                    }
                 }
                 self.agent_initiated_turn = false;
                 // Same edge, the identity half: anyone holding "the turn I was

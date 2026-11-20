@@ -15257,6 +15257,10 @@ async fn run_conversation_loop(
                     cancel_grok_agent_turn_asks(delegation_injection, conn_id).await;
                 }
 
+                {
+                    let mut s = state.write().await;
+                    s.borrowed_prompt_started = s.borrowed_turn.is_some();
+                }
                 emit_with_state(
                     state,
                     emitter,

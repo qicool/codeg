@@ -328,6 +328,12 @@ pub(crate) async fn handle_event(
             // CAS InProgress → Cancelled at the user-cancel entry point), so
             // we leave it alone here. `completed` transitions remain
             // frontend-driven.
+            // Serialize this status write with prompt admission. Once a new
+            // prompt wins, an earlier completion must not mark it for review.
+            let Ok(prompt_lock) = manager.clone_prompt_lock(&envelope.connection_id).await else {
+                return Ok(());
+            };
+            let prompt_guard = prompt_lock.lock_owned().await;
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
@@ -338,7 +344,8 @@ pub(crate) async fn handle_event(
                 // Re-entrant for this worker: a retry of this same envelope
                 // claims again and goes on. Only a CLI run's fallback that
                 // already wrote this turn's status makes it skip.
-                let claimed = snap.claim_turn_status(envelope.seq, TurnStatusWriter::Lifecycle);
+                let claimed = snap.borrowed_status_after_seq.is_none_or(|seq| seq < envelope.seq)
+                    && snap.claim_turn_status(envelope.seq, TurnStatusWriter::Lifecycle);
                 (
                     snap.conversation_id,
                     snap.last_assistant_text.clone(),
@@ -354,6 +361,7 @@ pub(crate) async fn handle_event(
             if claimed {
                 write_turn_status(db_conn, &state_arc, &emitter, cid, stop_reason).await?;
             }
+            drop(prompt_guard);
 
             // If this conversation was spawned by a delegation, resolve the
             // pending broker call. The broker maps the outcome onto the
@@ -363,6 +371,7 @@ pub(crate) async fn handle_event(
                     db_conn,
                     b.as_ref(),
                     &envelope.connection_id,
+                    envelope.seq,
                     cid,
                     stop_reason.as_str(),
                     last_text,
@@ -478,6 +487,7 @@ async fn forward_turn_complete_to_broker(
     db_conn: &DatabaseConnection,
     broker: &DelegationBroker,
     child_connection_id: &str,
+    seq: u64,
     conversation_id: i32,
     stop_reason: &str,
     last_text: Option<String>,
@@ -546,7 +556,7 @@ async fn forward_turn_complete_to_broker(
         ),
     };
     broker
-        .complete_call_from_child(&call_id, child_connection_id, outcome)
+        .complete_call_from_child(&call_id, child_connection_id, seq, outcome)
         .await;
 }
 

@@ -15,6 +15,7 @@ use crate::acp::connection::{
     SteerOutcome,
 };
 use crate::acp::agent_mentions::strip_route_separator_from_prompt;
+use crate::acp::delegation::spawner::{BorrowedTurn, LiveContinuation};
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
@@ -620,6 +621,24 @@ fn teardown_blocker(
         return Some(ConnectionBusy::DelegatedChild);
     }
     None
+}
+
+fn can_borrow_turn(
+    state: &crate::acp::session_state::SessionState,
+    conversation_id: i32,
+    external_session_id: &str,
+    child_live: impl Fn(&str) -> bool,
+) -> bool {
+    state.conversation_id == Some(conversation_id)
+        && state.external_id.as_deref() == Some(external_session_id)
+        && state.status == ConnectionStatus::Connected
+        && !state.turn_in_flight
+        && !state.agent_initiated_turn
+        && state.cli_run.is_none()
+        && !state.goal_active
+        && state.pending_question.is_none()
+        && state.pending_plan_approval.is_none()
+        && teardown_blocker(state, chrono::Utc::now(), child_live).is_none()
 }
 
 /// Whether a connection launched in `launch` is running in `current` (a folder
@@ -1318,6 +1337,7 @@ impl ConnectionManager {
         mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
         internal_suffix: Vec<PromptInputBlock>,
+        live: Option<(i32, &LiveContinuation<'_>)>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -1361,7 +1381,24 @@ impl ConnectionManager {
             .await
             .map_err(|_| AcpError::ProcessExited)?;
         {
+            let connections = if live.is_some() {
+                Some(self.connections.lock().await)
+            } else {
+                None
+            };
             let mut s = state_arc.write().await;
+            if let Some((cid, live)) = live {
+                let connections = connections.as_ref().expect("live prompt holds connections");
+                if !connections.contains_key(conn_id)
+                    || !can_borrow_turn(&s, cid, live.external_session_id, |child| {
+                        connections.contains_key(child)
+                    })
+                {
+                    return Err(AcpError::TurnInProgress);
+                }
+                s.borrowed_turn = Some(Arc::clone(&live.turn));
+                s.last_borrowed_task_id = Some(live.task_id.to_string());
+            }
             if s.turn_in_flight {
                 // Names the gate, not just the outcome: the linked path checks
                 // the same flag once before its side effects and again here, and
@@ -1372,6 +1409,9 @@ impl ConnectionManager {
                     "[ACP] prompt rejected at the send gate: a turn is already in flight"
                 );
                 return Err(AcpError::TurnInProgress);
+            }
+            if s.last_borrowed_task_id.is_some() {
+                s.borrowed_status_after_seq = Some(s.event_seq);
             }
             s.turn_in_flight = true;
         }
@@ -1386,7 +1426,7 @@ impl ConnectionManager {
     /// Clone the connection's `prompt_lock` under a short connections-map lock.
     /// Returned Arc allows the caller to hold the prompt lock without
     /// keeping the connections map locked.
-    async fn clone_prompt_lock(
+    pub(in crate::acp) async fn clone_prompt_lock(
         &self,
         conn_id: &str,
     ) -> Result<Arc<tokio::sync::Mutex<()>>, AcpError> {
@@ -1404,7 +1444,7 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None, Vec::new())
+        self.send_prompt_inner(conn_id, blocks, None, Vec::new(), None)
             .await
     }
 
@@ -1475,6 +1515,7 @@ impl ConnectionManager {
             delegation,
             client_message_id,
             Vec::new(),
+            None,
         )
         .await
     }
@@ -1504,6 +1545,7 @@ impl ConnectionManager {
             delegation,
             None,
             internal_suffix,
+            None,
         )
         .await
     }
@@ -1519,6 +1561,7 @@ impl ConnectionManager {
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
         internal_suffix: Vec<PromptInputBlock>,
+        live: Option<(i32, &LiveContinuation<'_>)>,
     ) -> Result<Option<i32>, AcpError> {
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
@@ -1564,7 +1607,13 @@ impl ConnectionManager {
         // observes `already_linked == true` after the first commits, so
         // it can't double-create a conversation row.
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
-        let _prompt_guard = prompt_lock.lock_owned().await;
+        let _prompt_guard = if live.is_some() {
+            prompt_lock
+                .try_lock_owned()
+                .map_err(|_| AcpError::TurnInProgress)?
+        } else {
+            prompt_lock.lock_owned().await
+        };
 
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
@@ -1584,6 +1633,13 @@ impl ConnectionManager {
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             let (bound, in_flight, launch_dir) = {
                 let s = conn.state.read().await;
+                if let Some((cid, live)) = live {
+                    if !can_borrow_turn(&s, cid, live.external_session_id, |child| {
+                        connections.contains_key(child)
+                    }) {
+                        return Err(AcpError::TurnInProgress);
+                    }
+                }
                 (s.conversation_id, s.turn_in_flight, s.working_dir.clone())
             };
             (
@@ -1988,7 +2044,7 @@ impl ConnectionManager {
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         match self
-            .send_prompt_inner(conn_id, blocks, user_message, internal_suffix)
+            .send_prompt_inner(conn_id, blocks, user_message, internal_suffix, live)
             .await
         {
             Ok(()) => {
@@ -2300,6 +2356,20 @@ impl ConnectionManager {
     }
 
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
+        self.cancel_prompt(db, conn_id, None).await
+    }
+
+    async fn cancel_prompt(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        borrowed: Option<&Arc<BorrowedTurn>>,
+    ) -> Result<(), AcpError> {
+        let _prompt_guard = if borrowed.is_some() {
+            Some(self.clone_prompt_lock(conn_id).await?.lock_owned().await)
+        } else {
+            None
+        };
         let (cmd_tx, state_arc, emitter) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -2311,10 +2381,23 @@ impl ConnectionManager {
                 conn.emitter.clone(),
             )
         };
-        cmd_tx
-            .send(ConnectionCommand::Cancel)
-            .await
-            .map_err(|_| AcpError::ProcessExited)?;
+        if let Some(turn) = borrowed {
+            let permit = cmd_tx.reserve().await.map_err(|_| AcpError::ProcessExited)?;
+            let state = state_arc.read().await;
+            if !state
+                .borrowed_turn
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, turn))
+            {
+                return Ok(());
+            }
+            permit.send(ConnectionCommand::Cancel);
+        } else {
+            cmd_tx
+                .send(ConnectionCommand::Cancel)
+                .await
+                .map_err(|_| AcpError::ProcessExited)?;
+        }
 
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
         // "running" state immediately. The agent typically replies with
@@ -4962,6 +5045,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         folder_id: i32,
         child_conversation_id: i32,
         brief: Option<String>,
+        live: Option<LiveContinuation<'_>>,
     ) -> Result<(), crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
         // Adopt the child's EXISTING row (caller-supplied path) — no delegation
@@ -4969,75 +5053,45 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         // delegation_call_id from the original delegation, and
         // `send_prompt_linked` rejects a link combined with an explicit
         // conversation_id precisely because adopted rows own their linkage.
+        if let Some(live) = &live {
+            // A CLI run's permission policy is assigned at spawn. Do not send
+            // that run's work into a live connection with a different policy.
+            let parent = self.manager.get_state(live.parent_connection_id).await;
+            let Some(parent) = parent else {
+                return Err(SpawnerError::ContinuationUnavailable);
+            };
+            if parent.read().await.cli_run.is_some() {
+                return Err(SpawnerError::ContinuationUnavailable);
+            }
+        }
         self.manager
-            .send_prompt_linked_with_suffix(
+            .send_prompt_linked_full(
                 &self.db,
                 conn_id,
                 vec![PromptInputBlock::Text { text: prompt }],
                 Some(folder_id),
                 Some(child_conversation_id),
                 None,
+                None,
                 brief_suffix(brief),
+                live.as_ref().map(|live| (child_conversation_id, live)),
             )
             .await
             .map(|_| ())
-            .map_err(|e| SpawnerError::Send(e.to_string()))
+            .map_err(|e| match e {
+                AcpError::TurnInProgress | AcpError::ConnectionNotFound(_) | AcpError::ProcessExited
+                    if live.is_some() =>
+                {
+                    SpawnerError::ContinuationUnavailable
+                }
+                e => SpawnerError::Send(e.to_string()),
+            })
     }
 
-    async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool {
+    async fn live_connection_for_continuation(&self, conversation_id: i32) -> Option<String> {
         self.manager
             .find_connection_by_conversation_id(conversation_id)
             .await
-            .is_some()
-    }
-
-    async fn release_idle_for_continuation(
-        &self,
-        conversation_id: i32,
-        external_session_id: &str,
-    ) -> bool {
-        let Some(conn_id) = self
-            .manager
-            .find_connection_by_conversation_id(conversation_id)
-            .await
-        else {
-            return true;
-        };
-        // Use the same admission lock as UI prompts and forks. If one is
-        // already entering, let it win; once we hold the lock a new prompt
-        // can only proceed after the old connection has been removed.
-        let Ok(lock) = self.manager.clone_prompt_lock(&conn_id).await else {
-            return false;
-        };
-        let Ok(_guard) = lock.try_lock_owned() else {
-            return false;
-        };
-        {
-            let connections = self.manager.connections.lock().await;
-            let Some(conn) = connections.get(&conn_id) else {
-                return false;
-            };
-            let Ok(state) = conn.state.try_read() else {
-                return false;
-            };
-            if state.conversation_id != Some(conversation_id)
-                || state.external_id.as_deref() != Some(external_session_id)
-                || state.status != ConnectionStatus::Connected
-                || state.turn_in_flight
-                || state.goal_active
-                || state.pending_question.is_some()
-                || state.pending_plan_approval.is_some()
-                || teardown_blocker(&state, chrono::Utc::now(), |child| {
-                    connections.contains_key(child)
-                })
-                .is_some()
-            {
-                return false;
-            }
-        }
-        // Wait for the old agent to finish writing the transcript before the
-        // new agent loads it. Use the same drain bookkeeping as broker close.
-        self.disconnect(&conn_id).await.is_ok()
     }
 
     async fn has_draining_child_for_conversation(&self, conversation_id: i32) -> bool {
@@ -5055,6 +5109,56 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .cancel(&self.db.conn, conn_id)
             .await
             .map_err(|e| crate::acp::delegation::spawner::SpawnerError::Cancel(e.to_string()))
+    }
+
+    async fn cancel_borrowed(
+        &self,
+        conn_id: &str,
+        turn: &Arc<BorrowedTurn>,
+    ) -> Result<(), crate::acp::delegation::spawner::SpawnerError> {
+        self.manager
+            .cancel_prompt(&self.db.conn, conn_id, Some(turn))
+            .await
+            .map_err(|e| crate::acp::delegation::spawner::SpawnerError::Cancel(e.to_string()))
+    }
+
+    async fn close_borrowed_for_task(&self, conversation_id: i32, task_id: &str) -> bool {
+        let Some(conn_id) = self.live_connection_for_continuation(conversation_id).await else {
+            return true;
+        };
+        let Ok(lock) = self.manager.clone_prompt_lock(&conn_id).await else {
+            return true;
+        };
+        let Ok(_guard) = lock.try_lock_owned() else {
+            return false;
+        };
+        {
+            let connections = self.manager.connections.lock().await;
+            let Some(conn) = connections.get(&conn_id) else {
+                return true;
+            };
+            let state = conn.state.read().await;
+            if state.conversation_id != Some(conversation_id)
+                || state.last_borrowed_task_id.as_deref() != Some(task_id)
+            {
+                return true;
+            }
+            if state.borrowed_turn.is_none()
+                && (state.status != ConnectionStatus::Connected
+                    || state.turn_in_flight
+                    || state.agent_initiated_turn
+                    || state.goal_active
+                    || state.pending_question.is_some()
+                    || state.pending_plan_approval.is_some()
+                    || teardown_blocker(&state, chrono::Utc::now(), |child| {
+                        connections.contains_key(child)
+                    })
+                    .is_some())
+            {
+                return false;
+            }
+        }
+        self.disconnect(&conn_id).await.is_ok()
     }
 
     async fn disconnect(
@@ -6550,19 +6654,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_handoff_preserves_active_work_and_waits_for_child_exit() {
-        use crate::acp::delegation::spawner::ConnectionSpawner;
+    async fn continuation_reuses_idle_connection_and_cancels_only_its_turn() {
+        use crate::acp::delegation::spawner::{ConnectionSpawner, SpawnerError};
         use std::sync::atomic::Ordering;
 
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/borrowed-child").await;
+        let row = conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+            .await.unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let mgr = Arc::new(ConnectionManager::new());
+        mgr.insert_test_connection("parent", AgentType::ClaudeCode, None, EventEmitter::Noop).await;
         let mut commands =
             insert_live_connection(&mgr, "user-child", AgentType::ClaudeCode, None).await;
         let child = state_of(&mgr, "user-child").await;
         {
             let mut state = child.write().await;
-            state.conversation_id = Some(42);
+            state.conversation_id = Some(row.id);
             state.external_id = Some("child-session".into());
             state.turn_in_flight = true;
         }
@@ -6571,10 +6679,20 @@ mod tests {
             db: Arc::new(db),
             data_dir: Arc::new(data_dir.path().to_path_buf()),
         };
-        assert!(!spawner.release_idle_for_continuation(42, "child-session").await);
+        let turn = Arc::new(BorrowedTurn::default());
+        let send = |external_session_id| spawner.send_resume_prompt(
+            "user-child", "follow-up".into(), folder_id, row.id, None,
+            Some(LiveContinuation {
+                external_session_id,
+                parent_connection_id: "parent",
+                task_id: "task-1",
+                turn: Arc::clone(&turn),
+            }),
+        );
+        assert!(matches!(send("child-session").await, Err(SpawnerError::ContinuationUnavailable)));
         child.write().await.turn_in_flight = false;
         child.write().await.goal_active = true;
-        assert!(!spawner.release_idle_for_continuation(42, "child-session").await);
+        assert!(matches!(send("child-session").await, Err(SpawnerError::ContinuationUnavailable)));
         child.write().await.goal_active = false;
         let admission = mgr
             .clone_prompt_lock("user-child")
@@ -6582,23 +6700,42 @@ mod tests {
             .unwrap()
             .lock_owned()
             .await;
-        assert!(!spawner.release_idle_for_continuation(42, "child-session").await);
+        assert!(matches!(send("child-session").await, Err(SpawnerError::ContinuationUnavailable)));
         drop(admission);
-        assert!(!spawner.release_idle_for_continuation(42, "other-session").await);
+        assert!(matches!(send("other-session").await, Err(SpawnerError::ContinuationUnavailable)));
+        let parent = state_of(&mgr, "parent").await;
+        parent.write().await.cli_run = Some(cli_tag("restricted"));
+        assert!(matches!(send("child-session").await, Err(SpawnerError::ContinuationUnavailable)));
+        parent.write().await.cli_run = None;
         assert!(commands.try_recv().is_err());
         assert!(mgr.get_state("user-child").await.is_some());
 
         let pid = Arc::clone(&mgr.connections.lock().await["user-child"].child_pid);
-        pid.store(1, Ordering::SeqCst);
-        let release = spawner.release_idle_for_continuation(42, "child-session");
-        tokio::pin!(release);
-        assert!(futures_util::poll!(&mut release).is_pending());
-        assert!(matches!(commands.try_recv(), Ok(ConnectionCommand::Disconnect)));
-        assert!(mgr.get_state("user-child").await.is_none());
-        assert!(spawner.has_draining_child_for_conversation(42).await);
+        pid.store(1234, Ordering::SeqCst);
+        send("child-session").await.unwrap();
+        assert!(matches!(commands.try_recv(), Ok(ConnectionCommand::Prompt { .. })));
+        let done = AcpEvent::TurnComplete {
+            session_id: "child-session".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: AgentType::ClaudeCode.to_string(),
+        };
+        emit_with_state(&child, &EventEmitter::Noop, done.clone()).await;
+        assert!(child.read().await.turn_in_flight);
+        assert!(turn.completion.get().is_none());
+
+        child.write().await.borrowed_prompt_started = true;
+        spawner.cancel_borrowed("user-child", &turn).await.unwrap();
+        assert!(matches!(commands.try_recv(), Ok(ConnectionCommand::Cancel)));
+        emit_with_state(&child, &EventEmitter::Noop, done).await;
+        assert_eq!(turn.completion.get().unwrap().seq, child.read().await.event_seq);
+        mgr.send_prompt("user-child", one_text_block()).await.unwrap();
+        assert!(matches!(commands.try_recv(), Ok(ConnectionCommand::Prompt { .. })));
+        spawner.cancel_borrowed("user-child", &turn).await.unwrap();
+        assert!(commands.try_recv().is_err());
+        assert!(mgr.get_state("user-child").await.is_some());
+        assert_eq!(pid.load(Ordering::SeqCst), 1234);
         pid.store(0, Ordering::SeqCst);
-        assert!(release.await);
-        assert!(!spawner.has_draining_child_for_conversation(42).await);
+        assert!(!spawner.close_borrowed_for_task(row.id, "task-1").await);
     }
 
     #[tokio::test]
@@ -7772,6 +7909,7 @@ mod tests {
             }],
             None,
             Vec::new(),
+            None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(

@@ -36,7 +36,8 @@ jobs:
         working-directory: src-tauri
         run: |
           cargo test --locked --no-default-features --features server-bin --lib acp::delegation
-          cargo test --locked --no-default-features --features server-bin --lib continuation_handoff_preserves_active_work_and_waits_for_child_exit
+          cargo test --locked --no-default-features --features server-bin --lib continuation_reuses_idle_connection_and_cancels_only_its_turn
+          cargo test --locked --no-default-features --features server-bin --lib acp::lifecycle
 
   build-installer:
     name: Windows x64 NSIS installer
