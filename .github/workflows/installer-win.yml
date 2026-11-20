@@ -9,6 +9,11 @@ on:
     branches:
       - feat/continue-session
   workflow_dispatch:
+    inputs:
+      regression_only:
+        description: Run delegation regression tests without rebuilding the installer
+        type: boolean
+        default: false
 
 env:
   RUST_BACKTRACE: short
@@ -23,7 +28,9 @@ jobs:
     name: Delegation regression tests
     runs-on: ubuntu-22.04
     env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       INSTA_UPDATE: "no"
     steps:
       - uses: actions/checkout@v4
@@ -35,12 +42,23 @@ jobs:
       - name: Run delegation tests
         working-directory: src-tauri
         run: |
+          (
+            while true; do
+              date -u
+              free -h
+              df -h .
+              sleep 30
+            done
+          ) &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
           cargo test --locked --no-default-features --features server-bin --lib acp::delegation
           cargo test --locked --no-default-features --features server-bin --lib continuation_reuses_idle_connection_and_cancels_only_its_turn
           cargo test --locked --no-default-features --features server-bin --lib acp::lifecycle
 
   build-installer:
     name: Windows x64 NSIS installer
+    if: github.event_name != 'workflow_dispatch' || !inputs.regression_only
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
