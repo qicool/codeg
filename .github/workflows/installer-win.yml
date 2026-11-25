@@ -14,6 +14,10 @@ on:
         description: Run delegation regression tests without rebuilding the installer
         type: boolean
         default: false
+      server_only:
+        description: Build only the Windows x64 server bundle
+        type: boolean
+        default: false
 
 env:
   RUST_BACKTRACE: short
@@ -26,6 +30,7 @@ concurrency:
 jobs:
   test-delegation:
     name: Delegation regression tests
+    if: github.event_name != 'workflow_dispatch' || !inputs.server_only
     runs-on: ubuntu-22.04
     env:
       CARGO_BUILD_JOBS: "1"
@@ -83,7 +88,7 @@ jobs:
 
   build-installer:
     name: Windows x64 NSIS installer
-    if: github.event_name != 'workflow_dispatch' || !inputs.regression_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.regression_only && !inputs.server_only)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -145,5 +150,87 @@ jobs:
         with:
           name: codeg-windows-x64-nsis
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  build-server:
+    name: Windows x64 server bundle
+    if: github.event_name == 'workflow_dispatch' && inputs.server_only
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: server-x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build server and companions
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          $features = @{
+            'codeg-server' = 'server-bin'
+            'codeg-mcp' = 'mcp-bin'
+            'codeg-computer-helper' = 'computer-helper'
+            'codeg-cli' = 'cli-bin'
+          }
+          foreach ($bin in @('codeg-server', 'codeg-mcp', 'codeg-computer-helper', 'codeg-cli')) {
+            cargo build --locked --release --bin $bin --no-default-features --features $features[$bin] --target x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Package and smoke test
+        shell: pwsh
+        run: |
+          $bundle = 'dist/codeg-server-windows-x64'
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+          foreach ($bin in @('codeg-server', 'codeg-mcp', 'codeg-computer-helper', 'codeg-cli')) {
+            Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$bin.exe" "$bundle/"
+          }
+          Copy-Item -Recurse out "$bundle/web"
+          & "$bundle/codeg-server.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $mcpHelp = (& "$bundle/codeg-mcp.exe" --help) -join "`n"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($mcpHelp -notlike '*codeg-mcp --parent-connection-id*') { throw 'Unexpected MCP help' }
+          $cliHelp = (& "$bundle/codeg-cli.exe" --help) -join "`n"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($cliHelp -notlike '*Usage: codeg-cli*') { throw 'Unexpected CLI help' }
+          if (-not (Test-Path "$bundle/web/index.html")) { throw 'Web frontend missing' }
+          Compress-Archive -Path $bundle -DestinationPath "$bundle.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$bundle.zip").Hash.ToLower()
+          "$hash  codeg-server-windows-x64.zip" | Set-Content -Encoding ascii "$bundle.zip.sha256"
+
+      - name: Upload server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-server-windows-x64
+          path: |
+            dist/codeg-server-windows-x64.zip
+            dist/codeg-server-windows-x64.zip.sha256
           if-no-files-found: error
           retention-days: 30
