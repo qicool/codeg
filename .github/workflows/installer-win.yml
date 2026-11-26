@@ -15,9 +15,16 @@ on:
         type: boolean
         default: false
       server_only:
-        description: Build only the Windows x64 server bundle
+        description: Build only the selected server bundle
         type: boolean
         default: false
+      server_platform:
+        description: Server bundle platform (used with server_only)
+        type: choice
+        options:
+          - windows-x64
+          - linux-x64
+        default: windows-x64
 
 env:
   RUST_BACKTRACE: short
@@ -155,7 +162,7 @@ jobs:
 
   build-server:
     name: Windows x64 server bundle
-    if: github.event_name == 'workflow_dispatch' && inputs.server_only
+    if: github.event_name == 'workflow_dispatch' && inputs.server_only && inputs.server_platform != 'linux-x64'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -232,5 +239,82 @@ jobs:
           path: |
             dist/codeg-server-windows-x64.zip
             dist/codeg-server-windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  build-server-linux:
+    name: Linux x64 server bundle
+    if: github.event_name == 'workflow_dispatch' && inputs.server_only && inputs.server_platform == 'linux-x64'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: server-x86_64-unknown-linux-gnu
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build server and companions
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          for pair in codeg-server:server-bin codeg-mcp:mcp-bin codeg-computer-helper:computer-helper codeg-cli:cli-bin; do
+            cargo build --locked --release --no-default-features --target x86_64-unknown-linux-gnu --bin "${pair%:*}" --features "${pair#*:}"
+          done
+
+      - name: Package and smoke test
+        run: |
+          set -euo pipefail
+          bundle=dist/codeg-server-linux-x64
+          mkdir -p "$bundle"
+          for bin in codeg-server codeg-mcp codeg-computer-helper codeg-cli; do
+            install -m 755 "src-tauri/target/x86_64-unknown-linux-gnu/release/$bin" "$bundle/$bin"
+          done
+          cp -r out "$bundle/web"
+          "$bundle/codeg-server" --version
+          "$bundle/codeg-mcp" --help > dist/mcp-help.txt
+          grep -F 'codeg-mcp --parent-connection-id' dist/mcp-help.txt
+          "$bundle/codeg-cli" --version
+          "$bundle/codeg-cli" --help > dist/cli-help.txt
+          grep -F 'Usage: codeg-cli' dist/cli-help.txt
+          test -f "$bundle/web/index.html"
+          tar -C dist -czf "$bundle.tar.gz" codeg-server-linux-x64
+          (cd dist && sha256sum codeg-server-linux-x64.tar.gz > codeg-server-linux-x64.tar.gz.sha256)
+
+      - name: Upload server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-server-linux-x64
+          path: |
+            dist/codeg-server-linux-x64.tar.gz
+            dist/codeg-server-linux-x64.tar.gz.sha256
           if-no-files-found: error
           retention-days: 30
