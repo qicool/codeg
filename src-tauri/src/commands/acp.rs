@@ -12786,26 +12786,47 @@ pub async fn acp_set_composer_mode(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn acp_prompt(
     connection_id: String,
     blocks: Vec<PromptInputBlock>,
     folder_id: Option<i32>,
     conversation_id: Option<i32>,
     client_message_id: Option<String>,
+    // An edited message: cut the session back to just before the message it
+    // replaces, in the same step (see `crate::acp::rewind`).
+    rewind: Option<crate::acp::rewind::RewindTarget>,
     db: State<'_, crate::db::AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager
-        .send_prompt_linked_with_message_id(
-            &db,
-            &connection_id,
-            blocks,
-            folder_id,
-            conversation_id,
-            None,
-            client_message_id,
-        )
-        .await?;
+    match rewind {
+        Some(rewind) => {
+            manager
+                .send_prompt_linked_rewinding(
+                    &db,
+                    &connection_id,
+                    blocks,
+                    folder_id,
+                    conversation_id,
+                    client_message_id,
+                    rewind,
+                )
+                .await?
+        }
+        None => {
+            manager
+                .send_prompt_linked_with_message_id(
+                    &db,
+                    &connection_id,
+                    blocks,
+                    folder_id,
+                    conversation_id,
+                    None,
+                    client_message_id,
+                )
+                .await?
+        }
+    };
     // A person typed this in a codeg window: a dispatch they write in is
     // theirs from now on.
     crate::personal_agent::note_owner_prompt(&connection_id, conversation_id);
@@ -12917,6 +12938,19 @@ pub async fn acp_cancel(
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    // A personal agent's handed-out work: the owner stopping it (D2),
+    // through to its end even if this call is dropped.
+    let conn = connection_id.clone();
+    let stopped = crate::commands::personal_agent::on_own_task(async move {
+        crate::personal_agent::stop::note_owner_cancel(&conn)
+            .await
+            .map_err(crate::app_error::AppCommandError::task_execution_failed)
+    })
+    .await
+    .map_err(|e| AcpError::protocol(e.message))?;
+    if stopped {
+        return Ok(());
+    }
     manager.cancel(&db.conn, &connection_id).await
 }
 
